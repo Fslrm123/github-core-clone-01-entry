@@ -57,19 +57,30 @@ async function register(port: number): Promise<void> {
   }
 }
 
-/** Poll GET /done until it answers {"done":true}; never return before that. */
+/**
+ * Poll GET /done until it answers {"done":true}; never return before that. The env
+ * answers at once while the suite runs, so a successful answer (even {"done":false})
+ * is polled again after a short steady wait; only a failed or slow poll backs off
+ * exponentially, so the entry notices completion promptly instead of drifting to the
+ * 2 s cap after a long trial.
+ */
 async function waitForDone(): Promise<void> {
-  for (let attempt = 0; ; attempt += 1) {
+  let failures = 0;
+  for (;;) {
     try {
       const res = await fetch(`${ENV_URL}/done`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
       if (res.ok) {
         const body = (await res.json()) as { done?: unknown };
         if (body.done === true) return;
+        failures = 0;
+        await sleep(RETRY_INITIAL_MS);
+        continue;
       }
     } catch {
-      // The env is not answering yet, or the poll timed out: it is not done, so poll again.
+      // The env is not answering, or the poll timed out: it is not done, so back off.
     }
-    await sleep(retryDelay(attempt));
+    await sleep(retryDelay(failures));
+    failures += 1;
   }
 }
 
