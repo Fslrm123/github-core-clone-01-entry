@@ -275,17 +275,22 @@ export function uploadPack(
   for (const packet of packets) {
     if (packet.kind === 'data') lines.push(packet.payload.toString('utf8'));
   }
+  // The delim packet (0001) separates the command from its arguments. decodePktLines
+  // reports it as kind 'delim', not as an empty data line, so track it from the
+  // packet stream: arguments are the data packets after the first delim.
+  const delimIndex = packets.findIndex((packet) => packet.kind === 'delim');
+  const argLines: string[] = [];
+  if (delimIndex >= 0) {
+    for (const packet of packets.slice(delimIndex + 1)) {
+      if (packet.kind === 'data') argLines.push(packet.payload.toString('utf8'));
+      else break;
+    }
+  }
   const first = (lines[0] ?? '').trim();
   if (gitProtocol === 'version=2' && first.startsWith('command=ls-refs')) {
     const args: LsRefsArgs = { peel: false, symrefs: false, unborn: false, prefixes: [] };
-    let pastDelim = false;
-    for (const line of lines.slice(1)) {
+    for (const line of argLines) {
       const text = line.trim();
-      if (text === '') {
-        pastDelim = true;
-        continue;
-      }
-      if (!pastDelim) continue;
       if (text === 'peel') args.peel = true;
       else if (text === 'symrefs') args.symrefs = true;
       else if (text === 'unborn') args.unborn = true;
@@ -302,14 +307,8 @@ export function uploadPack(
   const args: FetchArgs = { wants: [], haves: [], shallow: [], depth: null, thinPack: false, noProgress: false };
   const isV2 = gitProtocol === 'version=2' && first.startsWith('command=fetch');
   if (isV2) {
-    let pastDelim = false;
-    for (const line of lines.slice(1)) {
+    for (const line of argLines) {
       const text = line.trim();
-      if (text === '') {
-        pastDelim = true;
-        continue;
-      }
-      if (!pastDelim) continue;
       if (text === 'thin-pack') args.thinPack = true;
       else if (text === 'no-progress') args.noProgress = true;
       else if (text.startsWith('want ')) args.wants.push(text.slice(5).trim());

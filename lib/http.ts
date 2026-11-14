@@ -183,7 +183,10 @@ export function createServerWithStore(store: Store): Server {
             }
           }
         }
-        const result = handleRest(store, method, segments, query, body);
+        // The absolute origin, for Link headers: the suite parses them as absolute URLs.
+        const host = req.headers.host ?? 'entry';
+        const baseUrl = `http://${host}`;
+        const result = handleRest(store, method, segments, query, body, baseUrl);
         sendJson(res, result.status, result.body, result.headers ?? {});
         return;
       }

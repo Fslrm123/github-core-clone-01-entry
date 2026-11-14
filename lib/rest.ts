@@ -59,8 +59,12 @@ function pageParams(query: URLSearchParams): { page: number; perPage: number } {
   return { page, perPage };
 }
 
-/** Slice a list to one page and build the Link header (rel="next" when more follow). */
-function paginate<T>(items: T[], query: URLSearchParams, basePath: string): { page: T[]; link: string | null } {
+/**
+ * Slice a list to one page and build the Link header (rel="next" when more follow).
+ * The Link URL is absolute: the suite's sameOrigin check does `new URL(a).origin`,
+ * which throws on a relative URL and fails the pagination check.
+ */
+function paginate<T>(items: T[], query: URLSearchParams, basePath: string, baseUrl: string): { page: T[]; link: string | null } {
   const { page, perPage } = pageParams(query);
   const start = (page - 1) * perPage;
   const slice = items.slice(start, start + perPage);
@@ -69,7 +73,7 @@ function paginate<T>(items: T[], query: URLSearchParams, basePath: string): { pa
     const next = new URLSearchParams(query);
     next.set('page', String(page + 1));
     next.set('per_page', String(perPage));
-    link = `<${basePath}?${next.toString()}>; rel="next"`;
+    link = `<${baseUrl}${basePath}?${next.toString()}>; rel="next"`;
   }
   return { page: slice, link };
 }
@@ -159,9 +163,9 @@ function createRepo(store: Store, body: Record<string, unknown>): RestResult {
   return created(repoJson(repo));
 }
 
-function listUserRepos(store: Store, query: URLSearchParams): RestResult {
+function listUserRepos(store: Store, query: URLSearchParams, baseUrl: string): RestResult {
   const repos = store.reposOf(VIEWER_LOGIN);
-  const { page, link } = paginate(repos.map(repoJson), query, '/api/v3/user/repos');
+  const { page, link } = paginate(repos.map(repoJson), query, '/api/v3/user/repos', baseUrl);
   const headers: Record<string, string> = {};
   if (link !== null) headers.link = link;
   return ok(page, headers);
@@ -390,7 +394,7 @@ function createIssue(store: Store, repo: Repo, body: Record<string, unknown>): R
   return created(issueJson(repo, issue));
 }
 
-function listIssues(repo: Repo, query: URLSearchParams): RestResult {
+function listIssues(repo: Repo, query: URLSearchParams, baseUrl: string): RestResult {
   const state = query.get('state') ?? 'open';
   const sort = query.get('sort') ?? 'created';
   const direction = query.get('direction') ?? 'desc';
@@ -400,7 +404,7 @@ function listIssues(repo: Repo, query: URLSearchParams): RestResult {
       direction === 'asc' ? a.number - b.number : b.number - a.number,
     );
   }
-  const { page, link } = paginate(issues.map((issue) => issueJson(repo, issue)), query, `/api/v3/repos/${repo.fullName}/issues`);
+  const { page, link } = paginate(issues.map((issue) => issueJson(repo, issue)), query, `/api/v3/repos/${repo.fullName}/issues`, baseUrl);
   const headers: Record<string, string> = {};
   if (link !== null) headers.link = link;
   return ok(page, headers);
@@ -482,10 +486,10 @@ function createPull(store: Store, repo: Repo, body: Record<string, unknown>): Re
   return created(pullJson(repo, pull));
 }
 
-function listPulls(repo: Repo, query: URLSearchParams): RestResult {
+function listPulls(repo: Repo, query: URLSearchParams, baseUrl: string): RestResult {
   const state = query.get('state') ?? 'open';
   const pulls = repo.pulls.filter((pull) => state === 'all' || pull.state === state);
-  const { page, link } = paginate(pulls.map((pull) => pullJson(repo, pull)), query, `/api/v3/repos/${repo.fullName}/pulls`);
+  const { page, link } = paginate(pulls.map((pull) => pullJson(repo, pull)), query, `/api/v3/repos/${repo.fullName}/pulls`, baseUrl);
   const headers: Record<string, string> = {};
   if (link !== null) headers.link = link;
   return ok(page, headers);
@@ -597,6 +601,7 @@ export function handleRest(
   segments: string[],
   query: URLSearchParams,
   body: Record<string, unknown> | null,
+  baseUrl = '',
 ): RestResult {
   const json = body ?? {};
   // GET /api/v3/ — the API root.
@@ -620,7 +625,7 @@ export function handleRest(
   }
   // /api/v3/user/repos
   if (segments.length === 2 && segments[0] === 'user' && segments[1] === 'repos') {
-    if (method === 'GET') return listUserRepos(store, query);
+    if (method === 'GET') return listUserRepos(store, query, baseUrl);
     if (method === 'POST') return createRepo(store, json);
     return notFound();
   }
@@ -678,7 +683,7 @@ export function handleRest(
     // /issues
     if (rest[0] === 'issues' && rest.length === 1) {
       if (method === 'POST') return createIssue(store, repo, json);
-      if (method === 'GET') return listIssues(repo, query);
+      if (method === 'GET') return listIssues(repo, query, baseUrl);
       return notFound();
     }
     if (rest[0] === 'issues' && rest.length >= 2) {
@@ -699,7 +704,7 @@ export function handleRest(
     // /pulls
     if (rest[0] === 'pulls' && rest.length === 1) {
       if (method === 'POST') return createPull(store, repo, json);
-      if (method === 'GET') return listPulls(repo, query);
+      if (method === 'GET') return listPulls(repo, query, baseUrl);
       return notFound();
     }
     if (rest[0] === 'pulls' && rest.length >= 2) {
