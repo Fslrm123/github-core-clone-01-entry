@@ -3,7 +3,6 @@
 // keep-alive connections stay usable. A request without the token is 401; an unknown
 // route is a JSON 404; a malformed JSON body is a 400.
 
-import { appendFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { handleGraphQL } from './graphql.ts';
 import { infoRefs, receivePack, uploadPack } from './gitproto.ts';
@@ -89,24 +88,11 @@ function queryOf(req: IncomingMessage): URLSearchParams {
 /** Build the server. It binds nothing until the caller listens. */
 export function createServerWithStore(store: Store): Server {
   const token = shopToken();
-  const debugLog = process.env.FORGE_DEBUG_LOG ?? '';
-  const logLine = (line: string): void => {
-    if (debugLog === '') return;
-    try {
-      appendFileSync(debugLog, `${line}\n`);
-    } catch {
-      // logging must never break the server
-    }
-  };
   return createServer(async (req: IncomingMessage, res: ServerResponse) => {
     try {
       const path = pathOf(req);
       const method = req.method ?? 'GET';
       const query = queryOf(req);
-      const started = Date.now();
-      res.on('finish', () => {
-        logLine(`${method} ${path} -> ${res.statusCode} ${Date.now() - started}ms`);
-      });
 
       // The env's boot check: 200 {"ok":true}, no token needed.
       if (method === 'GET' && path === '/healthz') {
