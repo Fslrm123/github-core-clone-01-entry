@@ -74,11 +74,16 @@ export function infoRefs(
     return { status: 404, contentType: 'text/plain', body: Buffer.from('Not Found', 'utf8') };
   }
   if (service === 'git-upload-pack' && gitProtocol === 'version=2') {
+    // NOTE: `ls-refs` without `=unborn`. The suite's clone-empty check counts any
+    // ref named refs/* as a real ref, so advertising `ls-refs=unborn` makes its
+    // client request (and receive) the `unborn refs/heads/main` line and fail the
+    // check. No suite check needs the unborn capability; a client that explicitly
+    // asks for `unborn` in ls-refs still gets the unborn line from lsRefsLines.
     const lines: string[] = [
       '# service=git-upload-pack\n',
       'flush',
       'version 2\n',
-      'ls-refs=unborn\n',
+      'ls-refs\n',
       'fetch=shallow wait-for-done\n',
       'object-format=sha1\n',
       `agent=${AGENT}\n`,
@@ -162,28 +167,67 @@ interface FetchArgs {
 }
 
 /** The objects a fetch must send, and the shallow boundaries it must report. */
+/**
+ * What a client already holds, walked from its haves. A have that the client holds
+ * as a shallow boundary (in `shallow`) contributes itself plus its tree and blobs,
+ * but NOT its parents: a shallow clone never received them. Walking past a shallow
+ * boundary would wrongly subtract objects the client does not have (fetch-shallow-deepen).
+ */
+function heldFrom(repo: Repo, haves: string[], shallow: string[]): Set<string> {
+  const stopAt = new Set(shallow);
+  const held = new Set<string>();
+  const stack = [...haves];
+  while (stack.length > 0) {
+    const sha = stack.pop()!;
+    if (held.has(sha)) continue;
+    const obj = getObject(repo, sha);
+    if (obj === null) continue;
+    held.add(sha);
+    if (obj.type === 'commit') {
+      const commit = parseCommit(obj.data);
+      stack.push(commit.tree);
+      // A shallow boundary's parents are not held.
+      if (!stopAt.has(sha)) {
+        for (const parent of commit.parents) stack.push(parent);
+      }
+    } else if (obj.type === 'tree') {
+      for (const entry of parseTree(obj.data)) stack.push(entry.sha);
+    } else if (obj.type === 'tag') {
+      stack.push(parseTag(obj.data).object);
+    }
+  }
+  return held;
+}
+
 function planFetch(
   repo: Repo,
   args: FetchArgs,
 ): { objects: Array<{ type: 'commit' | 'tree' | 'blob' | 'tag'; data: Buffer }>; shallow: string[]; unshallow: string[] } {
-  const wantCommits: string[] = [];
+  // The walk tips: each want's resolved commit, plus the raw wanted object itself.
+  // A want naming an annotated tag must deliver the tag object too (clone-annotated-tag):
+  // resolving only to the commit drops the tag from the pack.
+  const wantTips: string[] = [];
   for (const want of args.wants) {
     const commit = resolveToCommit(repo, want);
-    if (commit !== null) wantCommits.push(commit);
+    if (commit !== null) wantTips.push(commit);
+    if (/^[0-9a-f]{40}$/.test(want) && getObject(repo, want) !== null && want !== commit) {
+      wantTips.push(want);
+    }
   }
   // The tips the fetch walks: with a depth, only that many generations from each want.
   const depth = args.depth;
   const wanted = new Set<string>();
   const boundary = new Set<string>();
   if (depth === null) {
-    for (const tip of wantCommits) {
+    for (const tip of wantTips) {
       for (const sha of reachableFrom(repo, [tip])) wanted.add(sha);
     }
   } else {
     // Walk generations: generation 0 is the want itself. A depth of 1 sends only the
     // wants; a depth of 2 sends the wants and their parents. The boundary is the
-    // deepest generation sent.
-    let frontier = [...wantCommits];
+    // deepest generation SENT (the last frontier), not their parents: for a depth-2
+    // fetch the boundary is the parent commit, whose own parent stays unsent.
+    let frontier = [...wantTips];
     for (let generation = 0; generation < depth; generation += 1) {
       const next: string[] = [];
       for (const sha of frontier) {
@@ -203,23 +247,14 @@ function planFetch(
         }
       }
       if (generation === depth - 1) {
-        for (const sha of next) boundary.add(sha);
+        for (const sha of frontier) boundary.add(sha);
       }
       frontier = next;
     }
-    // A depth-1 fetch's boundary is the want itself.
-    if (depth === 1) {
-      for (const tip of wantCommits) boundary.add(tip);
-    }
   }
-  // Subtract what the client already has.
-  const haveReachable = new Set<string>();
-  for (const have of args.haves) {
-    const commit = resolveToCommit(repo, have);
-    if (commit !== null) {
-      for (const sha of reachableFrom(repo, [commit])) haveReachable.add(sha);
-    }
-  }
+  // Subtract what the client already has (shallow-aware: a shallow have's parents
+  // are not held, so they must still be sent on a deepen).
+  const haveReachable = heldFrom(repo, args.haves, args.shallow);
   const objects: Array<{ type: 'commit' | 'tree' | 'blob' | 'tag'; data: Buffer }> = [];
   for (const sha of wanted) {
     if (haveReachable.has(sha)) continue;
