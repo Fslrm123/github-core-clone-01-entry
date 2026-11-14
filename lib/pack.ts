@@ -169,18 +169,52 @@ function readOfsOffset(buf: Buffer, offset: number): { value: number; bytes: num
 
 /**
  * Inflate the zlib stream starting at `offset`, finding its exact length by binary search.
- * inflateSync ignores trailing bytes and throws on a truncated stream, so the smallest
- * length that inflates to `expectedSize` is the stream's true length.
+ * inflateSync ignores trailing bytes and throws on a truncated stream. A binary
+ * search for the exact compressed length costs ~11 inflates per object; instead,
+ * inflate the whole remainder once (one call), then anchor the end: a zlib stream
+ * is [2-byte header][DEFLATE][4-byte Adler-32 of the plaintext, big-endian], so the
+ * Adler-32 of the inflated data marks the stream's end. A candidate is verified by
+ * inflating exactly that slice; a binary search is the fallback if no anchor is found.
  */
+function adler32(data: Buffer): number {
+  let a = 1;
+  let b = 0;
+  for (let i = 0; i < data.length; i += 1) {
+    a = (a + data[i]!) % 65521;
+    b = (b + a) % 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
 function inflateExact(buf: Buffer, offset: number, expectedSize: number): { data: Buffer; length: number } {
+  const data = inflateSync(buf.subarray(offset));
+  if (data.length !== expectedSize) throw new Error('packfile: inflated size mismatch');
+  // The Adler-32 trailer sits at the end of the zlib stream; find it.
+  const adler = adler32(data);
+  const needle = Buffer.alloc(4);
+  needle.writeUInt32BE(adler, 0);
+  // The compressed stream is at most the plaintext size plus a small overhead.
+  const searchEnd = Math.min(buf.length, offset + expectedSize + 64);
+  let pos = buf.indexOf(needle, offset + 2);
+  while (pos >= 0 && pos + 4 <= searchEnd) {
+    const length = pos + 4 - offset;
+    try {
+      const check = inflateSync(buf.subarray(offset, offset + length));
+      if (check.length === expectedSize && check.equals(data)) return { data, length };
+    } catch {
+      // Not the real trailer; keep searching.
+    }
+    pos = buf.indexOf(needle, pos + 1);
+  }
+  // Fallback: binary search for the smallest prefix that inflates to the size.
   let lo = 1;
   let hi = buf.length - offset;
   let best = -1;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
     try {
-      const data = inflateSync(buf.subarray(offset, offset + mid));
-      if (data.length === expectedSize) {
+      const trial = inflateSync(buf.subarray(offset, offset + mid));
+      if (trial.length === expectedSize) {
         best = mid;
         hi = mid - 1;
       } else {
