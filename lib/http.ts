@@ -41,14 +41,15 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
 
 function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
   const text = body === null ? '' : `${JSON.stringify(body)}\n`;
+  const buf = Buffer.from(text, 'utf8');
   const headers: Record<string, string> = {
     'content-type': JSON_TYPE,
-    'content-length': String(Buffer.byteLength(text)),
+    'content-length': String(buf.length),
     'x-github-request-id': `req-${(requestCounter += 1)}`,
     ...extra,
   };
   res.writeHead(status, headers);
-  res.end(text);
+  res.end(buf);
 }
 
 function sendRaw(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
@@ -69,30 +70,23 @@ function authorized(req: IncomingMessage, token: string): boolean {
   return presented === token;
 }
 
-function pathOf(req: IncomingMessage): string {
+/** Parse the request URL once: the pathname and the query, reused by every route. */
+function parseUrl(req: IncomingMessage): { path: string; query: URLSearchParams } {
   try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
+    const url = new URL(req.url ?? '/', 'http://entry');
+    return { path: url.pathname, query: url.searchParams };
   } catch {
-    return '/';
-  }
-}
-
-function queryOf(req: IncomingMessage): URLSearchParams {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
-  } catch {
-    return new URLSearchParams();
+    return { path: '/', query: new URLSearchParams() };
   }
 }
 
 /** Build the server. It binds nothing until the caller listens. */
 export function createServerWithStore(store: Store): Server {
   const token = shopToken();
-  return createServer(async (req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     try {
-      const path = pathOf(req);
+      const { path, query } = parseUrl(req);
       const method = req.method ?? 'GET';
-      const query = queryOf(req);
 
       // The env's boot check: 200 {"ok":true}, no token needed.
       if (method === 'GET' && path === '/healthz') {
@@ -100,8 +94,8 @@ export function createServerWithStore(store: Store): Server {
         return;
       }
 
-      // Git smart HTTP: /{owner}/{repo}.git/...
-      const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(.*)$/.exec(path);
+      // Git smart HTTP: /{owner}/{repo}.git/... (never under /api/).
+      const gitMatch = path.startsWith('/api/') ? null : /^\/([^/]+)\/([^/]+)\.git\/(.*)$/.exec(path);
       if (gitMatch !== null) {
         if (!authorized(req, token)) {
           sendJson(res, 401, { message: 'Requires authentication' });
@@ -201,4 +195,8 @@ export function createServerWithStore(store: Store): Server {
       }
     }
   });
+  // Request/response pairs are small and latency-bound: disable Nagle so a reply
+  // never waits to coalesce with the next write.
+  server.on('connection', (socket) => socket.setNoDelay(true));
+  return server;
 }

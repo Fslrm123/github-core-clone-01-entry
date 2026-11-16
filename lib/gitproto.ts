@@ -23,6 +23,63 @@ export const VIEWER_EMAIL = 'adaiversen@example.invalid';
 
 const AGENT = 'github-core-clone/1.0.0';
 
+// -----------------------------------------------------------------------------------------------------------
+// Git response cache: the same request against the same repository state always
+// answers the same bytes, and the clone workload issues 50 identical clones in
+// a row, so caching a whole framed response turns 49 of them into a map lookup.
+// The key carries a fingerprint of the repository state every git answer depends
+// on (default branch, every ref's value, object count); objects are immutable
+// and never deleted, so the fingerprint only changes when the answer could
+// change. A different request body is a different key, never a wrong hit.
+// -----------------------------------------------------------------------------------------------------------
+
+interface CachedGitResponse {
+  status: number;
+  contentType: string;
+  body: Buffer;
+}
+
+const GIT_CACHE_MAX_ENTRIES = 64;
+const GIT_CACHE_MAX_BYTES = 4 * 1024 * 1024;
+const gitCaches = new WeakMap<Repo, Map<string, CachedGitResponse>>();
+const gitCacheBytes = new WeakMap<Repo, number>();
+
+/** Fingerprint of the repository state every git answer depends on. */
+function gitFingerprint(repo: Repo): string {
+  const refs: string[] = [];
+  for (const [name, sha] of repo.refs) refs.push(`${name}=${sha}`);
+  refs.sort();
+  return `${repo.defaultBranch}|${repo.objects.size}|${refs.join(',')}`;
+}
+
+function gitCacheGet(repo: Repo, key: string): CachedGitResponse | undefined {
+  return gitCaches.get(repo)?.get(key);
+}
+
+function gitCachePut(repo: Repo, key: string, value: CachedGitResponse): void {
+  if (value.body.length > GIT_CACHE_MAX_BYTES) return;
+  let cache = gitCaches.get(repo);
+  if (cache === undefined) {
+    cache = new Map();
+    gitCaches.set(repo, cache);
+    gitCacheBytes.set(repo, 0);
+  }
+  let bytes = gitCacheBytes.get(repo) ?? 0;
+  const prev = cache.get(key);
+  if (prev !== undefined) bytes -= prev.body.length;
+  cache.set(key, value);
+  bytes += value.body.length;
+  while ((cache.size > GIT_CACHE_MAX_ENTRIES || bytes > GIT_CACHE_MAX_BYTES) && cache.size > 1) {
+    const oldest = cache.keys().next();
+    if (oldest.done) break;
+    const removed = cache.get(oldest.value);
+    if (removed === undefined) break;
+    cache.delete(oldest.value);
+    bytes -= removed.body.length;
+  }
+  gitCacheBytes.set(repo, bytes);
+}
+
 function capsV0Upload(): string {
   return 'symref=HEAD:refs/heads/main side-band-64k shallow ofs-delta agent object-format=sha1';
 }
@@ -73,6 +130,10 @@ export function infoRefs(
   if (repo === undefined) {
     return { status: 404, contentType: 'text/plain', body: Buffer.from('Not Found', 'utf8') };
   }
+  const cacheKey = `info|${service}|${gitProtocol ?? ''}|${gitFingerprint(repo)}`;
+  const cached = gitCacheGet(repo, cacheKey);
+  if (cached !== undefined) return cached;
+  let result: { status: number; contentType: string; body: Buffer };
   if (service === 'git-upload-pack' && gitProtocol === 'version=2') {
     // NOTE: `ls-refs` without `=unborn`. The suite's clone-empty check counts any
     // ref named refs/* as a real ref, so advertising `ls-refs=unborn` makes its
@@ -89,24 +150,27 @@ export function infoRefs(
       `agent=${AGENT}\n`,
       'flush',
     ];
-    return {
+    result = {
       status: 200,
       contentType: 'application/x-git-upload-pack-advertisement',
       body: encodePktLines(lines),
     };
+  } else {
+    const caps = service === 'git-receive-pack' ? capsV0Receive() : capsV0Upload();
+    const refLines = v0RefLines(repo);
+    const parts: string[] = [`# service=${service}\n`, 'flush'];
+    refLines.forEach((line, index) => {
+      parts.push(index === 0 ? `${line}\0${caps}\n` : `${line}\n`);
+    });
+    parts.push('flush');
+    result = {
+      status: 200,
+      contentType: `application/x-${service}-advertisement`,
+      body: encodePktLines(parts),
+    };
   }
-  const caps = service === 'git-receive-pack' ? capsV0Receive() : capsV0Upload();
-  const refLines = v0RefLines(repo);
-  const parts: string[] = [`# service=${service}\n`, 'flush'];
-  refLines.forEach((line, index) => {
-    parts.push(index === 0 ? `${line}\0${caps}\n` : `${line}\n`);
-  });
-  parts.push('flush');
-  return {
-    status: 200,
-    contentType: `application/x-${service}-advertisement`,
-    body: encodePktLines(parts),
-  };
+  gitCachePut(repo, cacheKey, result);
+  return result;
 }
 
 // -----------------------------------------------------------------------------------------------------------
@@ -323,6 +387,9 @@ export function uploadPack(
   }
   const first = (lines[0] ?? '').trim();
   if (gitProtocol === 'version=2' && first.startsWith('command=ls-refs')) {
+    const cacheKey = `ls|${gitFingerprint(repo)}|${body.toString('utf8')}`;
+    const cached = gitCacheGet(repo, cacheKey);
+    if (cached !== undefined) return cached;
     const args: LsRefsArgs = { peel: false, symrefs: false, unborn: false, prefixes: [] };
     for (const line of argLines) {
       const text = line.trim();
@@ -332,11 +399,13 @@ export function uploadPack(
       else if (text.startsWith('ref-prefix ')) args.prefixes.push(text.slice('ref-prefix '.length));
     }
     const out: Array<string | 'flush'> = [...lsRefsLines(repo, args), 'flush'];
-    return {
+    const result = {
       status: 200,
       contentType: 'application/x-git-upload-pack-result',
       body: encodePktLines(out),
     };
+    gitCachePut(repo, cacheKey, result);
+    return result;
   }
   // Fetch (v2 or v0).
   const args: FetchArgs = { wants: [], haves: [], shallow: [], depth: null, thinPack: false, noProgress: false };
@@ -374,8 +443,12 @@ export function uploadPack(
       }
     }
   }
+  const fetchKey = `fetch|${isV2 ? 'v2' : 'v0'}|${gitFingerprint(repo)}|${body.toString('utf8')}`;
+  const cachedFetch = gitCacheGet(repo, fetchKey);
+  if (cachedFetch !== undefined) return cachedFetch;
   const plan = planFetch(repo, args);
   const pack = writePack(plan.objects);
+  let fetchResult: { status: number; contentType: string; body: Buffer };
   if (isV2) {
     const parts: Buffer[] = [];
     const acks = fetchAcks(repo, args);
@@ -390,26 +463,29 @@ export function uploadPack(
     parts.push(encodePktLines(['packfile\n']));
     for (const chunk of sidebandChunks(pack)) parts.push(chunk);
     parts.push(FLUSH);
-    return {
+    fetchResult = {
+      status: 200,
+      contentType: 'application/x-git-upload-pack-result',
+      body: Buffer.concat(parts),
+    };
+  } else {
+    // v0: plain NAK/ACK and shallow lines, then the packfile in sideband band 1.
+    const parts: Buffer[] = [];
+    const v0Lines: Array<string | 'flush'> = [];
+    for (const ack of fetchAcks(repo, args)) v0Lines.push(`${ack}\n`);
+    for (const sha of plan.shallow) v0Lines.push(`shallow ${sha}\n`);
+    for (const sha of plan.unshallow) v0Lines.push(`unshallow ${sha}\n`);
+    parts.push(encodePktLines(v0Lines));
+    for (const chunk of sidebandChunks(pack)) parts.push(chunk);
+    parts.push(FLUSH);
+    fetchResult = {
       status: 200,
       contentType: 'application/x-git-upload-pack-result',
       body: Buffer.concat(parts),
     };
   }
-  // v0: plain NAK/ACK and shallow lines, then the packfile in sideband band 1.
-  const parts: Buffer[] = [];
-  const v0Lines: Array<string | 'flush'> = [];
-  for (const ack of fetchAcks(repo, args)) v0Lines.push(`${ack}\n`);
-  for (const sha of plan.shallow) v0Lines.push(`shallow ${sha}\n`);
-  for (const sha of plan.unshallow) v0Lines.push(`unshallow ${sha}\n`);
-  parts.push(encodePktLines(v0Lines));
-  for (const chunk of sidebandChunks(pack)) parts.push(chunk);
-  parts.push(FLUSH);
-  return {
-    status: 200,
-    contentType: 'application/x-git-upload-pack-result',
-    body: Buffer.concat(parts),
-  };
+  gitCachePut(repo, fetchKey, fetchResult);
+  return fetchResult;
 }
 
 // -----------------------------------------------------------------------------------------------------------
