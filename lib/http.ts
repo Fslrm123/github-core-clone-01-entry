@@ -216,9 +216,9 @@ export function createServerWithStore(store: Store): Server {
 
       // REST v3.
       if (path === '/api/v3' || path.startsWith('/api/v3/')) {
-        const segments = path === '/api/v3' ? [] : path.slice('/api/v3/'.length).split('/').filter((part) => part !== '');
         // A repeated GET of the same URL (the read workload fetches one issue
-        // 2,000 times) answers from the serialized-response cache.
+        // 2,000 times) answers from the serialized-response cache. The lookup
+        // runs before the segments split so a hit skips that work entirely.
         if (method === 'GET') {
           const cached = restGetCacheGet(req.url ?? '/');
           if (cached !== undefined) {
@@ -226,6 +226,7 @@ export function createServerWithStore(store: Store): Server {
             return;
           }
         }
+        const segments = path === '/api/v3' ? [] : path.slice('/api/v3/'.length).split('/').filter((part) => part !== '');
         let body: Record<string, unknown> | null = null;
         if (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') {
           const raw = await readBody(req);

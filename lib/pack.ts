@@ -314,6 +314,6 @@ export function readPack(buf: Buffer, resolveBase?: (sha: string) => PackObject 
 export function verifyPackTrailer(buf: Buffer): boolean {
   if (buf.length < 20) return false;
   const body = buf.subarray(0, buf.length - 20);
-  const trailer = buf.subarray(buf.length - 20).toString('hex');
-  return createHash('sha1').update(body).digest('hex') === trailer;
+  const trailer = buf.subarray(buf.length - 20);
+  return createHash('sha1').update(body).digest().equals(trailer);
 }

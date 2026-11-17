@@ -369,6 +369,9 @@ export function uploadPack(
   if (repo === undefined) {
     return { status: 404, contentType: 'text/plain', body: Buffer.from('Not Found', 'utf8') };
   }
+  // The whole request body as text, converted once: the fast-path key, the
+  // ls-refs key and the fetch key below all used to convert it separately.
+  const bodyText = body.toString('utf8');
   // Fast path: a v2 ls-refs / fetch against unchanged repo state answers from the
   // cache without parsing the pkt-lines at all. The first pkt-line names the
   // command, and the cache key carries the whole raw body, so a hit is exact —
@@ -380,7 +383,7 @@ export function uploadPack(
       const firstLine = body.subarray(4, firstLen).toString('utf8').trim();
       if (firstLine === 'command=ls-refs' || firstLine === 'command=fetch') {
         const kind = firstLine === 'command=ls-refs' ? 'ls' : 'fetch|v2';
-        const cacheKey = `${kind}|${gitFingerprint(repo)}|${body.toString('utf8')}`;
+        const cacheKey = `${kind}|${gitFingerprint(repo)}|${bodyText}`;
         const cached = gitCacheGet(repo, cacheKey);
         if (cached !== undefined) return cached;
       }
@@ -404,7 +407,7 @@ export function uploadPack(
   }
   const first = (lines[0] ?? '').trim();
   if (gitProtocol === 'version=2' && first.startsWith('command=ls-refs')) {
-    const cacheKey = `ls|${gitFingerprint(repo)}|${body.toString('utf8')}`;
+    const cacheKey = `ls|${gitFingerprint(repo)}|${bodyText}`;
     const cached = gitCacheGet(repo, cacheKey);
     if (cached !== undefined) return cached;
     const args: LsRefsArgs = { peel: false, symrefs: false, unborn: false, prefixes: [] };
@@ -460,7 +463,7 @@ export function uploadPack(
       }
     }
   }
-  const fetchKey = `fetch|${isV2 ? 'v2' : 'v0'}|${gitFingerprint(repo)}|${body.toString('utf8')}`;
+  const fetchKey = `fetch|${isV2 ? 'v2' : 'v0'}|${gitFingerprint(repo)}|${bodyText}`;
   const cachedFetch = gitCacheGet(repo, fetchKey);
   if (cachedFetch !== undefined) return cachedFetch;
   const plan = planFetch(repo, args);
