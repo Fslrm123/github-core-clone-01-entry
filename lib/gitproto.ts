@@ -369,6 +369,23 @@ export function uploadPack(
   if (repo === undefined) {
     return { status: 404, contentType: 'text/plain', body: Buffer.from('Not Found', 'utf8') };
   }
+  // Fast path: a v2 ls-refs / fetch against unchanged repo state answers from the
+  // cache without parsing the pkt-lines at all. The first pkt-line names the
+  // command, and the cache key carries the whole raw body, so a hit is exact —
+  // the same key the slow path computes after parsing. Anything that is not a
+  // v2 command line falls through to the full parse below.
+  if (gitProtocol === 'version=2' && body.length >= 4) {
+    const firstLen = parseInt(body.subarray(0, 4).toString('ascii'), 16);
+    if (firstLen >= 4 && firstLen <= body.length) {
+      const firstLine = body.subarray(4, firstLen).toString('utf8').trim();
+      if (firstLine === 'command=ls-refs' || firstLine === 'command=fetch') {
+        const kind = firstLine === 'command=ls-refs' ? 'ls' : 'fetch|v2';
+        const cacheKey = `${kind}|${gitFingerprint(repo)}|${body.toString('utf8')}`;
+        const cached = gitCacheGet(repo, cacheKey);
+        if (cached !== undefined) return cached;
+      }
+    }
+  }
   const packets = decodePktLines(body);
   const lines: string[] = [];
   for (const packet of packets) {

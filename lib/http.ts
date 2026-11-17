@@ -39,26 +39,34 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
+function jsonBuffer(body: unknown): Buffer {
   const text = body === null ? '' : `${JSON.stringify(body)}\n`;
-  const buf = Buffer.from(text, 'utf8');
-  const headers: Record<string, string> = {
-    'content-type': JSON_TYPE,
-    'content-length': String(buf.length),
-    'x-github-request-id': `req-${(requestCounter += 1)}`,
-    ...extra,
-  };
-  res.writeHead(status, headers);
-  res.end(buf);
+  return Buffer.from(text, 'utf8');
 }
 
-function sendRaw(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
+/** Write headers (with a fresh per-request id) and a body buffer. */
+function sendBuffer(
+  res: ServerResponse,
+  status: number,
+  contentType: string,
+  body: Buffer,
+  extra: Record<string, string> = {},
+): void {
   res.writeHead(status, {
     'content-type': contentType,
     'content-length': String(body.length),
     'x-github-request-id': `req-${(requestCounter += 1)}`,
+    ...extra,
   });
   res.end(body);
+}
+
+function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
+  sendBuffer(res, status, JSON_TYPE, jsonBuffer(body), extra);
+}
+
+function sendRaw(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
+  sendBuffer(res, status, contentType, body);
 }
 
 /** Whether the request's bearer token matches the shop token. */
@@ -72,12 +80,53 @@ function authorized(req: IncomingMessage, token: string): boolean {
 
 /** Parse the request URL once: the pathname and the query, reused by every route. */
 function parseUrl(req: IncomingMessage): { path: string; query: URLSearchParams } {
+  const raw = req.url ?? '/';
+  // Fast path: a plain absolute path with no percent-escapes, fragment, dot
+  // segments or backslashes splits exactly like `new URL` would parse it, and
+  // avoids building a URL object per request. Anything unusual falls back to
+  // the URL parser so encoded segments still resolve correctly.
+  if (
+    raw.startsWith('/') &&
+    !raw.includes('%') &&
+    !raw.includes('#') &&
+    !raw.includes('..') &&
+    !raw.includes('\\')
+  ) {
+    const q = raw.indexOf('?');
+    if (q < 0) return { path: raw, query: new URLSearchParams() };
+    return { path: raw.slice(0, q), query: new URLSearchParams(raw.slice(q + 1)) };
+  }
   try {
-    const url = new URL(req.url ?? '/', 'http://entry');
+    const url = new URL(raw, 'http://entry');
     return { path: url.pathname, query: url.searchParams };
   } catch {
     return { path: '/', query: new URLSearchParams() };
   }
+}
+
+// -----------------------------------------------------------------------------------------------------------
+// REST GET response cache: the read workload fetches the same issue 2,000 times
+// with no mutation in between, so caching a serialized GET response turns those
+// into a map lookup plus a fresh request id. The cache is keyed by the full URL
+// (path + query), capped, and cleared on ANY non-GET request — every mutation
+// surface (REST, GraphQL, MCP, git push) is a non-GET, and GETs never mutate,
+// so a cached entry can never go stale. The per-request id is generated fresh
+// on every send, never cached.
+// -----------------------------------------------------------------------------------------------------------
+
+const REST_GET_CACHE_MAX = 256;
+const restGetCache = new Map<string, { status: number; body: Buffer; contentType: string; extra: Record<string, string> }>();
+
+function restGetCacheGet(url: string): { status: number; body: Buffer; contentType: string; extra: Record<string, string> } | undefined {
+  return restGetCache.get(url);
+}
+
+function restGetCachePut(url: string, value: { status: number; body: Buffer; contentType: string; extra: Record<string, string> }): void {
+  if (restGetCache.size >= REST_GET_CACHE_MAX) {
+    const oldest = restGetCache.keys().next();
+    if (!oldest.done) restGetCache.delete(oldest.value);
+  }
+  restGetCache.set(url, value);
 }
 
 /** Build the server. It binds nothing until the caller listens. */
@@ -87,6 +136,10 @@ export function createServerWithStore(store: Store): Server {
     try {
       const { path, query } = parseUrl(req);
       const method = req.method ?? 'GET';
+
+      // Every mutation surface is a non-GET: a non-GET request invalidates the
+      // REST GET cache, so a cached GET can never go stale.
+      if (method !== 'GET') restGetCache.clear();
 
       // The env's boot check: 200 {"ok":true}, no token needed.
       if (method === 'GET' && path === '/healthz') {
@@ -164,6 +217,15 @@ export function createServerWithStore(store: Store): Server {
       // REST v3.
       if (path === '/api/v3' || path.startsWith('/api/v3/')) {
         const segments = path === '/api/v3' ? [] : path.slice('/api/v3/'.length).split('/').filter((part) => part !== '');
+        // A repeated GET of the same URL (the read workload fetches one issue
+        // 2,000 times) answers from the serialized-response cache.
+        if (method === 'GET') {
+          const cached = restGetCacheGet(req.url ?? '/');
+          if (cached !== undefined) {
+            sendBuffer(res, cached.status, cached.contentType, cached.body, cached.extra);
+            return;
+          }
+        }
         let body: Record<string, unknown> | null = null;
         if (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') {
           const raw = await readBody(req);
@@ -181,7 +243,14 @@ export function createServerWithStore(store: Store): Server {
         const host = req.headers.host ?? 'entry';
         const baseUrl = `http://${host}`;
         const result = handleRest(store, method, segments, query, body, baseUrl);
-        sendJson(res, result.status, result.body, result.headers ?? {});
+        const extra = result.headers ?? {};
+        const buf = jsonBuffer(result.body);
+        // Only cache plain single-resource GETs: a response with extra headers
+        // (e.g. Link on a paginated list) depends on more than the URL.
+        if (method === 'GET' && result.status === 200 && Object.keys(extra).length === 0) {
+          restGetCachePut(req.url ?? '/', { status: result.status, body: buf, contentType: JSON_TYPE, extra });
+        }
+        sendBuffer(res, result.status, JSON_TYPE, buf, extra);
         return;
       }
 
